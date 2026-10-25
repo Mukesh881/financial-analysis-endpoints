@@ -2,6 +2,7 @@
 
 import argparse
 import functools
+import os
 from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -19,7 +20,9 @@ mcp = MCPServer(
                  "Outputs are informational, not investment advice.",
 )
 
-Period = Literal["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+# Built from core so the MCP schema enums cannot drift from core validation.
+Period = Literal[tuple(core.PERIODS)]
+Interval = Literal[core.INTERVALS]
 
 
 def _tool(fn):
@@ -46,7 +49,7 @@ def get_quotes(symbols: list[str]) -> core.QuotesResponse:
 @_tool
 def get_price_history(symbol: str, start_date: str | None = None, end_date: str | None = None,
                       period: Period | None = None,
-                      interval: Literal["1d", "1wk", "1mo"] = "1d",
+                      interval: Interval = "1d",
                       max_points: int = 100) -> core.HistoryResponse:
     """OHLCV bars for one symbol plus a summary (first/last close, return %, high, low).
 
@@ -76,10 +79,17 @@ def analyze_stock(symbol: str, start_date: str | None = None, end_date: str | No
     return core.analyze_stock(symbol, start_date, end_date, period)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Run the finapi MCP server.")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
-    mcp.run(transport=parser.parse_args().transport)
+    parser.add_argument("--host", default=os.getenv("FINAPI_MCP_HOST", "127.0.0.1"))
+    # Default differs from finapi-rest (8000) so both front doors can run side by side.
+    parser.add_argument("--port", type=int, default=int(os.getenv("FINAPI_MCP_PORT", "8001")))
+    args = parser.parse_args(argv)
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

@@ -53,3 +53,22 @@ def test_provider_failure_is_tool_error(market):
     market.error = ConnectionError("boom")
     result = call("get_price_history", {"symbol": "AAPL"})
     assert result.is_error and "boom" in _text(result)
+
+
+def test_schema_enums_come_from_core():
+    import typing
+
+    from finapi import core, mcp_server
+    assert typing.get_args(mcp_server.Period) == tuple(core.PERIODS)
+    assert typing.get_args(mcp_server.Interval) == core.INTERVALS
+
+
+def test_http_transport_port_is_configurable(monkeypatch):
+    from finapi import mcp_server
+    seen = {}
+    monkeypatch.setattr(mcp_server.mcp, "run", lambda **kw: seen.update(kw))
+    mcp_server.main(["--transport", "streamable-http", "--port", "9001"])
+    assert seen == {"transport": "streamable-http", "host": "127.0.0.1", "port": 9001}
+    seen.clear()
+    mcp_server.main([])
+    assert seen == {"transport": "stdio"}

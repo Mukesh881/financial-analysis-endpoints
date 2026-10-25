@@ -1,7 +1,9 @@
+import threading
 from datetime import date, timedelta
 
 import pandas as pd
 import pytest
+from yfinance.exceptions import YFTickerMissingError
 
 from finapi import core
 from finapi.core import InvalidInputError, NotFoundError, UpstreamError
@@ -214,3 +216,74 @@ def test_cache_is_bounded(market, monkeypatch):
     for day in range(1, 20):
         core.get_price_history("AAPL", start_date=f"2024-01-{day:02d}", end_date="2024-02-01")
     assert len(core._CACHE) <= 5
+
+
+# --- review fixes -----------------------------------------------------------------------
+
+
+
+def test_small_prices_keep_precision(market):
+    market.infos["SHIB-USD"] = {"quoteType": "CRYPTOCURRENCY", "regularMarketPrice": 0.0000123,
+                                "regularMarketPreviousClose": 0.0000120}
+    market.infos["EURUSD=X"] = {"quoteType": "CURRENCY", "regularMarketPrice": 1.08563,
+                                "regularMarketPreviousClose": 1.08}
+    shib, eur = core.get_quotes("SHIB-USD,EURUSD=X").quotes
+    assert shib.price == 0.0000123 and shib.change_pct == 2.5
+    assert eur.price == 1.08563
+    assert core._r(65432.171) == 65432.17 and core._r(180.4049) == 180.405
+
+
+def test_non_numeric_info_value_is_none(market):
+    market.infos["ODD"] = {"quoteType": "EQUITY", "regularMarketPrice": "N/A",
+                           "regularMarketVolume": "lots"}
+    aapl, odd = core.get_quotes("AAPL,ODD").quotes
+    assert aapl.price == 110.0 and odd.price is None and odd.volume is None
+
+
+def test_ampersand_ticker_accepted():
+    assert core.normalize_symbol("m&m.ns") == "M&M.NS"
+
+
+def test_ticker_missing_error_is_not_found(market):
+    market.error = YFTickerMissingError("NOPE", "no data found")
+    with pytest.raises(NotFoundError):
+        core.get_price_history("NOPE")
+
+
+def test_empty_info_not_cached(market):
+    market.infos["AAPL"], real = {}, market.infos["AAPL"]
+    with pytest.raises(NotFoundError):
+        core.get_company_profile("AAPL")
+    market.infos["AAPL"] = real
+    assert core.get_company_profile("AAPL").name == "Apple Inc."
+
+
+def test_refreshed_entry_is_not_evicted_first(monkeypatch):
+    core._CACHE.clear()
+    monkeypatch.setattr(core, "MAX_CACHE_ENTRIES", 3)
+    core._cached(("t", "a"), 0, lambda: 1)       # expires immediately
+    core._cached(("t", "b"), 100, lambda: 2)
+    core._cached(("t", "a"), 100, lambda: 3)     # refresh a -> now newest
+    core._cached(("t", "c"), 100, lambda: 4)
+    core._cached(("t", "d"), 100, lambda: 5)     # full: evicts oldest = b
+    assert ("t", "a") in core._CACHE and ("t", "b") not in core._CACHE
+
+
+def test_cache_concurrent_access(monkeypatch):
+    core._CACHE.clear()
+    monkeypatch.setattr(core, "MAX_CACHE_ENTRIES", 50)
+    errors = []
+
+    def worker(n):
+        try:
+            for i in range(3000):
+                core._cached(("t", f"{n}-{i}"), 0 if i % 2 else 100, lambda i=i: i)
+        except RuntimeError as exc:  # pragma: no cover - only on failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and len(core._CACHE) <= 50

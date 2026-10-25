@@ -11,7 +11,7 @@ call over **MCP** or **REST**. Both front doors wrap the same core, so they beha
 | `analyze_stock` | `GET /v1/analysis/{symbol}` | Return %, annualized volatility %, max drawdown %, SMA-50/200, RSI-14, MACD(12,26,9), ATR-14, plain-language signals |
 
 **Inputs.** Symbols are Yahoo tickers: `AAPL`, `BRK-B`, `^GSPC`, `EURUSD=X`, `BTC-USD`,
-`RELIANCE.NS`. Windows are `start_date`/`end_date` (`YYYY-MM-DD`, inclusive; `end_date` defaults
+`RELIANCE.NS`, `M&M.NS`. Windows are `start_date`/`end_date` (`YYYY-MM-DD`, inclusive; `end_date` defaults
 to today) **or** `period` (`5d 1mo 3mo 6mo 1y 2y 5y 10y ytd max`). History intervals: `1d 1wk 1mo`.
 
 **Errors** are written for the model to act on. REST returns
@@ -22,6 +22,8 @@ to today) **or** `period` (`5d 1mo 3mo 6mo 1y 2y 5y 10y ytd max`). History inter
 
 - **Small outputs by default.** History is downsampled and summarised, profiles are truncated, and
   officers are opt-in, so a tool call doesn't eat the context window.
+- **Full precision for small prices.** FX rates and sub-cent crypto keep ~6 significant
+  figures (`1.08563`, `0.0000123`); percentages are rounded to 2 decimals.
 - **Units in field names** (`volatility_annualized_pct`, `max_drawdown_pct`) so the model doesn't
   guess.
 - **Factual signals, not advice.** E.g. `"RSI-14 is 74.2: overbought zone (>= 70)."`, plus a fixed
@@ -40,7 +42,8 @@ pip install -e '.[dev]'
 
 ```bash
 finapi-mcp                              # stdio (for Claude Desktop / Claude Code / IDEs)
-finapi-mcp --transport streamable-http  # HTTP, at http://127.0.0.1:8000/mcp
+finapi-mcp --transport streamable-http  # HTTP at http://127.0.0.1:8001/mcp (--host/--port,
+                                        # or FINAPI_MCP_HOST / FINAPI_MCP_PORT)
 ```
 
 Claude Code: `claude mcp add finapi -- /path/to/.venv/bin/finapi-mcp`

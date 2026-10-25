@@ -5,6 +5,7 @@ REST (`finapi.rest`) and MCP (`finapi.mcp_server`) are thin wrappers over this m
 
 import math
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from pydantic import BaseModel
+from yfinance.exceptions import YFTickerMissingError
 
 
 class FinApiError(Exception):
@@ -37,7 +39,7 @@ class UpstreamError(FinApiError):
 
 # --- validation -------------------------------------------------------------------------
 
-_SYMBOL_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,14}$")
+_SYMBOL_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&]{0,14}$")
 MAX_SYMBOLS = 10
 PERIOD_DAYS = {"5d": 7, "1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 731, "5y": 1827,
                "10y": 3653}
@@ -45,7 +47,7 @@ PERIODS = [*PERIOD_DAYS, "ytd", "max"]
 INTERVALS = ("1d", "1wk", "1mo")
 WARMUP_DAYS = 300
 INFO_TTL, HISTORY_TTL = 60, 900
-MAX_CACHE_ENTRIES = 512
+MAX_CACHE_ENTRIES = 128
 DISCLAIMER = "Informational metrics only, not investment advice."
 
 
@@ -103,12 +105,21 @@ def resolve_window(start_date: str | None, end_date: str | None, period: str | N
 
 # --- indicators -------------------------------------------------------------------------
 
-def _r(value, digits: int = 2) -> float | None:
-    """Round to plain float; NaN/inf/None become None so output is always JSON-safe."""
-    if value is None:
+def _r(value, digits: int | None = None) -> float | None:
+    """Plain JSON-safe float: NaN/inf/None/non-numeric become None.
+
+    With digits=None, keep ~6 significant figures (min 2 decimals) so FX rates and
+    sub-cent crypto prices survive: 65432.17, 1.08563, 0.0000123.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
         return None
-    value = float(value)
-    return round(value, digits) if math.isfinite(value) else None
+    if not math.isfinite(value):
+        return None
+    if digits is None:
+        digits = 2 if value == 0 else max(2, 5 - math.floor(math.log10(abs(value))))
+    return round(value, digits)
 
 
 def _wilder(series: pd.Series, n: int) -> pd.Series:
@@ -127,7 +138,7 @@ def rsi(close: pd.Series, n: int = 14) -> float | None:
     loss = _wilder(-diff.clip(upper=0), n).iloc[-1]
     if loss == 0:
         return 100.0 if gain > 0 else 50.0
-    return _r(100 - 100 / (1 + gain / loss))
+    return _r(100 - 100 / (1 + gain / loss), 2)
 
 
 def macd(close: pd.Series) -> tuple[float, float, float] | None:
@@ -149,13 +160,13 @@ def atr(df: pd.DataFrame, n: int = 14) -> float | None:
 
 def annualized_volatility_pct(close: pd.Series) -> float | None:
     returns = close.pct_change().dropna()
-    return _r(returns.std(ddof=1) * math.sqrt(252) * 100) if len(returns) >= 2 else None
+    return _r(returns.std(ddof=1) * math.sqrt(252) * 100, 2) if len(returns) >= 2 else None
 
 
 def max_drawdown_pct(close: pd.Series) -> float | None:
     if close.empty:
         return None
-    return _r(((close / close.cummax()) - 1).min() * 100)
+    return _r(((close / close.cummax()) - 1).min() * 100, 2)
 
 
 def downsample(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
@@ -168,6 +179,7 @@ def downsample(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
 # --- market data (the only yfinance access; tests replace the two _fetch_* functions) ---
 
 _CACHE: dict = {}
+_CACHE_LOCK = threading.Lock()
 
 
 def _fetch_history(symbol: str, start: date | None, end_exclusive: date,
@@ -184,34 +196,43 @@ def _fetch_info(symbol: str) -> dict:
 
 
 def _cached(key: tuple, ttl: int, fn):
-    hit = _CACHE.get(key)
+    """TTL cache around a provider call. Only successful results are stored; the lock guards
+    the dict (not the fetch), since REST, MCP and get_quotes all call this from threads."""
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
     if hit and hit[0] > time.monotonic():
         return hit[1]
     try:
         value = fn()
     except FinApiError:
         raise
+    except YFTickerMissingError as exc:
+        raise NotFoundError(f"No data for {key[1]}: {exc}. Check the symbol.") from exc
     except Exception as exc:
         raise UpstreamError(
             f"Market data provider failed for {key[1]}: {exc}. Retry shortly.") from exc
-    now = time.monotonic()
-    if len(_CACHE) >= MAX_CACHE_ENTRIES:
-        for k in [k for k, (expires, _) in _CACHE.items() if expires <= now]:
-            _CACHE.pop(k, None)
-        while len(_CACHE) >= MAX_CACHE_ENTRIES:  # still full: evict oldest inserted
-            _CACHE.pop(next(iter(_CACHE)), None)
-    _CACHE[key] = (now + ttl, value)
+    with _CACHE_LOCK:
+        now = time.monotonic()
+        _CACHE.pop(key, None)  # re-insert so dict order is last-refresh order
+        if len(_CACHE) >= MAX_CACHE_ENTRIES:
+            for k in [k for k, (expires, _) in _CACHE.items() if expires <= now]:
+                del _CACHE[k]
+            while len(_CACHE) >= MAX_CACHE_ENTRIES:  # still full: evict least recently stored
+                del _CACHE[next(iter(_CACHE))]
+        _CACHE[key] = (now + ttl, value)
     return value
 
 
 def _info(symbol: str) -> dict:
-    info = _cached(("info", symbol), INFO_TTL, lambda: _fetch_info(symbol))
-    if not (info.get("longName") or info.get("shortName")
-            or info.get("quoteType") not in (None, "NONE")):
-        raise NotFoundError(
-            f"Unknown symbol {symbol}. Check the ticker; non-US listings need an exchange "
-            "suffix such as .NS, .L or .T.")
-    return info
+    def fetch():
+        info = _fetch_info(symbol) or {}
+        if not (info.get("longName") or info.get("shortName")
+                or info.get("quoteType") not in (None, "NONE")):
+            raise NotFoundError(  # raised inside the fetch so an empty reply is never cached
+                f"Unknown symbol {symbol}. Check the ticker; non-US listings need an exchange "
+                "suffix such as .NS, .L or .T.")
+        return info
+    return _cached(("info", symbol), INFO_TTL, fetch)
 
 
 def _history(symbol: str, start: date | None, end: date, interval: str) -> pd.DataFrame:
@@ -323,11 +344,15 @@ def _day(ts) -> str:
 
 
 def _int(value) -> int | None:
-    return int(value) if value is not None and not pd.isna(value) else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):  # None, NaN, "N/A"
+        return None
 
 
 def _pct_change(first, last) -> float | None:
-    return _r((last / first - 1) * 100) if first and last is not None else None
+    first, last = _r(first), _r(last)
+    return _r((last / first - 1) * 100, 2) if first and last is not None else None
 
 
 def _quote(symbol: str) -> Quote:
