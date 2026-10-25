@@ -207,3 +207,10 @@ def test_info_cached(market):
     core.get_company_profile("AAPL")
     core.get_quotes(["AAPL"])
     assert market.info_calls == ["AAPL"]
+
+
+def test_cache_is_bounded(market, monkeypatch):
+    monkeypatch.setattr(core, "MAX_CACHE_ENTRIES", 5)
+    for day in range(1, 20):
+        core.get_price_history("AAPL", start_date=f"2024-01-{day:02d}", end_date="2024-02-01")
+    assert len(core._CACHE) <= 5

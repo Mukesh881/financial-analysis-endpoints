@@ -45,6 +45,7 @@ PERIODS = [*PERIOD_DAYS, "ytd", "max"]
 INTERVALS = ("1d", "1wk", "1mo")
 WARMUP_DAYS = 300
 INFO_TTL, HISTORY_TTL = 60, 900
+MAX_CACHE_ENTRIES = 512
 DISCLAIMER = "Informational metrics only, not investment advice."
 
 
@@ -193,7 +194,13 @@ def _cached(key: tuple, ttl: int, fn):
     except Exception as exc:
         raise UpstreamError(
             f"Market data provider failed for {key[1]}: {exc}. Retry shortly.") from exc
-    _CACHE[key] = (time.monotonic() + ttl, value)
+    now = time.monotonic()
+    if len(_CACHE) >= MAX_CACHE_ENTRIES:
+        for k in [k for k, (expires, _) in _CACHE.items() if expires <= now]:
+            _CACHE.pop(k, None)
+        while len(_CACHE) >= MAX_CACHE_ENTRIES:  # still full: evict oldest inserted
+            _CACHE.pop(next(iter(_CACHE)), None)
+    _CACHE[key] = (now + ttl, value)
     return value
 
 
