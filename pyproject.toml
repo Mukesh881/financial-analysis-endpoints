@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finapi"
+version = "2.0.0"
+description = "Financial data tools for LLM agents over REST and MCP, backed by Yahoo Finance"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "yfinance",
+    "pandas",
+    "numpy",
+    "pydantic>=2",
+    "mcp>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx", "ruff"]
+
+[project.scripts]
+finapi-rest = "finapi.rest:main"
+finapi-mcp = "finapi.mcp_server:main"
+
+[tool.setuptools]
+packages = ["finapi"]
+
+[tool.ruff]
+line-length = 100
